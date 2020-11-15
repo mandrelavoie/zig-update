@@ -1,0 +1,187 @@
+#!/usr/bin/env sh
+#
+# Author: Marc-André Lavoie
+# License: MIT
+#
+# Small script I made to keep my Zig install up to date.
+# It will fetch the latest release from the Zig website and create a symlink to it at $HOME/.zig/zig.
+# You can switch to a specific version by running `zig-update [latest|0.7|0.6|...]`
+#
+# Example:
+# ```
+# $ zig-update 0.7
+# Downloading https://ziglang.org/download/index.json...
+# Downloading https://ziglang.org/download/0.7.0/zig-linux-x86_64-0.7.0.tar.xz...
+# Switched to Zig version 0.7.0.
+# $ zig version
+# 0.7.0
+# ```
+#
+# The tool will remember your choice and stay on that version from now on until you specify a new one.
+# To switch back to the latest version:
+# ```
+# $ zig-update latest
+# Downloading https://ziglang.org/download/index.json...
+# Zig latest already present and up to date.
+# Switched to Zig version latest.
+# ```
+#
+# For this to work, you will need to add ~/.zig/zig to your path. The tool will offer to do it for you.
+#
+# You can change the directory used to install Zig by setting the `ZIG_UPDATE_DIR` variable.
+
+
+set -eu
+
+abort() {
+    echo "${1-}"
+    echo "Aborting..."
+    exit 1
+}
+
+requires_command() {
+    if ! command -v "${1}" >/dev/null 2>&1
+    then
+        abort "Command \"${1}\" is required to run this script."
+    fi
+}
+
+requires_command "jq"
+
+ARCH="x86_64-linux"
+
+ROOT_DIR=${ZIG_UPDATE_DIR:-${HOME}/.zig}
+HASHES_DIR="${ROOT_DIR}/hashes"
+INSTALLS_DIR="${ROOT_DIR}/installs"
+SYMLINK_PATH="${ROOT_DIR}/zig"
+
+ZIG_UPDATE_COMMENT="# zig-updater"
+PROFILE_FILE="${HOME}/.profile"
+
+INDEX_URL="https://ziglang.org/download/index.json"
+INDEX_FILE="index.json"
+PRINT_HELP=0
+
+if [ -L "${SYMLINK_PATH}" ]
+then
+    CURRENT_VERSION=$(readlink -f "${SYMLINK_PATH}" | xargs basename)
+else
+    CURRENT_VERSION="none"
+fi
+
+if [ "$#" -gt 1 ]
+then
+    PRINT_HELP=1
+fi
+
+case ${1:-"none"} in
+    "latest")
+        ZIG_VERSION="latest" ;;
+    [0123456789].[0123456789].[0123456789])
+        ZIG_VERSION=${1} ;;
+    0.[0123456789])
+        ZIG_VERSION="${1}.0" ;;
+    "none")
+        if [ "${CURRENT_VERSION}" = "none" ]
+        then
+            ZIG_VERSION="latest"
+        else
+            ZIG_VERSION=${CURRENT_VERSION}
+        fi;;
+    "--help")
+        PRINT_HELP=1;;
+    *)
+        echo "Unrecognized zig version \"${1}\""
+        PRINT_HELP=1 ;;
+esac
+
+if [ $PRINT_HELP -eq 1 ]
+then
+    echo "Usage: ${0} [latest|0.7|...]"
+    echo ""
+    echo "If no version is specified, it will default to the last version used."
+
+    exit 0
+fi
+
+ensure_directory_exists() {
+    if [ ! -d "${1}" ]
+    then
+        echo "Creating ${1}..."
+        mkdir -p "${1}"
+    fi
+}
+
+ensure_directory_exists "${ROOT_DIR}"
+ensure_directory_exists "${INSTALLS_DIR}"
+ensure_directory_exists "${HASHES_DIR}"
+
+cd "${ROOT_DIR}"
+echo "Downloading ${INDEX_URL}..."
+wget -qO "${INDEX_FILE}" "${INDEX_URL}"
+
+get_value_from_json() {
+    case ${ZIG_VERSION} in
+        "latest")
+            real_version="master";;
+        *)
+            real_version=${ZIG_VERSION};;
+    esac
+
+    jq -r ".\"${real_version}\".\"${ARCH}\".${1}" < "${INDEX_FILE}"
+}
+
+download_and_extract_tarball() {
+    echo "Downloading ${1}..."
+
+    tmpdir=$(mktemp -d)
+    cd "${tmpdir}"
+    filename=$(basename "${1}")
+
+    wget -qO "${filename}" "${1}"
+
+    downloaded_hash=$(sha256sum "${filename}" | awk '{ print $1 }')
+    if [ "${downloaded_hash}" != "${2}" ];
+    then
+        abort "Download failed. Wrong checksum: ${downloaded_hash} != ${2}. Please try again."
+    fi
+
+    tar -xf "${filename}" -C "${INSTALLS_DIR}" --one-top-level="${ZIG_VERSION}" --strip-components 1
+    echo "${2}" > "${HASHES_DIR}/${ZIG_VERSION}"
+
+    cd "${ROOT_DIR}"
+    rm -rf "${tmpdir}"
+}
+
+UP_TO_DATE_HASH=$(get_value_from_json shasum)
+CURRENT_HASH_FILE="${HASHES_DIR}/${ZIG_VERSION}"
+
+if [ ! -f "${CURRENT_HASH_FILE}" -o "$(cat "${CURRENT_HASH_FILE}" 2>/dev/null)" != "${UP_TO_DATE_HASH}" ];
+then
+    download_and_extract_tarball "$(get_value_from_json tarball)" "${UP_TO_DATE_HASH}"
+else
+    echo "Zig ${ZIG_VERSION} already present and up to date."
+fi
+
+case :$PATH: in
+    *:"${SYMLINK_PATH}":*)
+        ;;
+    *)
+        if ! grep -q "${ZIG_UPDATE_COMMENT}" "${PROFILE_FILE}";
+        then
+            echo "You will need to add ${SYMLINK_PATH} to your path \$PATH."
+
+            read -r -p "Would you like me to update your ~/.profile file to add it? [y/N]" answer
+            if [ "$answer" != "${answer#[Yy]}" ] ;then
+                printf "${ZIG_UPDATE_COMMENT}\nexport PATH=\"${SYMLINK_PATH}:\${PATH}\"" >> ${PROFILE_FILE}
+                echo "Your profile file has been updated! You'll need to run \`source ~/.profile\` for it to take effect on the current shell."
+            fi
+        fi
+        ;;
+esac
+
+if [ "${CURRENT_VERSION}" != "${ZIG_VERSION}" ]
+then
+    ln -sfn "${INSTALLS_DIR}/${ZIG_VERSION}" "${SYMLINK_PATH}"
+    echo "Switched to Zig version ${ZIG_VERSION}."
+fi
